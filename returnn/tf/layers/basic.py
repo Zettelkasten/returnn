@@ -167,9 +167,11 @@ def get_concat_sources_data_template(src_layers, name=None):
 def concat_sources_with_opt_dropout(src_layers, dropout=0, dropout_noise_shape=None, dropout_on_forward=False):
   """
   :param list[LayerBase] src_layers:
-  :param float dropout: will be applied if train_flag is set
-  :param tuple|list|dict|None dropout_noise_shape:
-  :param bool dropout_on_forward: apply dropout during inference
+  :param float dropout: dropout rate that will be applied if train_flag is set or dropout_on_forward is enabled
+  :param tuple|list|dict|None dropout_noise_shape: provide 1 for broadcasting or None otherwise for each axis.
+  The default "None" will broadcast across all dynamic axes including the batch axis.
+  Use {"*": None} to disable broadcasting for all axes.
+  :param bool dropout_on_forward: apply dropout also during inference
   :return: data with placeholders set
   :rtype: Data
   """
@@ -558,6 +560,8 @@ class ActivationLayer(CopyLayer):
 class BatchNormLayer(CopyLayer):
   """
   Implements batch-normalization (http://arxiv.org/abs/1502.03167) as a separate layer.
+
+  Also see :class:`NormLayer`.
   """
   layer_class = "batch_norm"
 
@@ -577,7 +581,15 @@ class BatchNormLayer(CopyLayer):
 
 class LayerNormLayer(_ConcatInputLayer):
   """
-  Applies layer-normalization.
+  Applies `layer-normalization <https://arxiv.org/abs/1607.06450>`__.
+
+  Note that we *just* normalize over the feature-dim axis here.
+  This is consistent to the default behavior of :class:`tf.keras.layers.LayerNormalization`
+  and also how it is commonly used in many models, including Transformer.
+
+  However, there are cases where it would be common to normalize over all axes except batch-dim,
+  or all axes except batch and time.
+  For a more generic variant, see :class:`NormLayer`.
   """
   layer_class = "layer_norm"
 
@@ -595,6 +607,76 @@ class LayerNormLayer(_ConcatInputLayer):
     with tf.name_scope("normalized"):
       norm_x = (x - mean) * tf_compat.v1.rsqrt(variance + epsilon)
     self.output.placeholder = norm_x * scale + bias
+    self.output.size_placeholder = self.input_data.size_placeholder.copy()
+
+  @classmethod
+  def get_out_data_from_opts(cls, sources, name, **kwargs):
+    """
+    :param list[LayerBase] sources:
+    :param str name:
+    :rtype: Data
+    """
+    return get_concat_sources_data_template(sources, name="%s_output" % name)
+
+
+class NormLayer(_ConcatInputLayer):
+  """
+  Normalize over specified axes, e.g. time and/or feature axis.
+  In case of just feature (``axes="F"``),
+  this corresponds to `layer normalization <https://arxiv.org/abs/1607.06450>`__ (see :class:`LayerNormLayer`).
+  In case of time and feature (``axes="TF"``) for a 3D input,
+  or more general all except batch (``axes="except_batch"``),
+  this corresponds to `group normalization <https://arxiv.org/abs/1803.08494>`__ with G=1,
+  or non-standard layer normalization.
+  (The definition of layer-normalization is not clear on what axes should be normalized over.
+  In many other frameworks, the default axis is just the last axis,
+  which is usually the feature axis.
+  However, in certain implementations and models,
+  it is also common to normalize over all axes except batch.)
+
+  The statistics are calculated just on the input.
+  There are no running statistics (in contrast to batch normalization, see :class:`BatchNormLayer`).
+
+  For some discussion on the definition of layer-norm vs group-norm,
+  also see
+  `here <https://stats.stackexchange.com/questions/485550/is-group-norm-with-g-1-equiv-to-layer-norm>`__
+  and `here <https://github.com/tensorflow/addons/issues/2143>`__.
+  """
+  layer_class = "norm"
+
+  def __init__(self, axes, param_shape="F", scale=True, bias=True, epsilon=1e-6, **kwargs):
+    """
+    :param str|list[str] axes: axes over which the mean and variance are computed, e.g. "F" or "TF"
+    :param str|list[str]|tuple[str]|int|list[int]|tuple[int] param_shape: shape of the scale and bias parameters.
+      You can also refer to (static) axes of the input, such as the feature-dim.
+      This is also the default, i.e. a param-shape of [F], independent of the axes to normalize over.
+    :param bool scale: add trainable scale parameters
+    :param bool bias: add trainable bias parameters
+    :param float epsilon: epsilon for numerical stability
+    """
+    super(NormLayer, self).__init__(**kwargs)
+    assert not self.input_data.sparse
+    x = self.input_data.placeholder
+    assert isinstance(param_shape, str)  # not implemented otherwise yet
+    param_axes = sorted(self.input_data.get_axes_from_description(param_shape))
+    param_shape = [self.input_data.batch_shape[axis] for axis in param_axes]
+    assert all(isinstance(dim, int) for dim in param_shape), "%s: only static param shape allowed" % self
+    param_bc_shape = [dim if axis in param_axes else 1 for (axis, dim) in enumerate(self.input_data.batch_shape)]
+    axes = self.input_data.get_axes_from_description(axes)
+
+    mean = tf.reduce_mean(x, axis=axes, keepdims=True, name="mean")
+    variance = tf.reduce_mean(tf.square(x - mean), axis=axes, keepdims=True, name="variance")
+    with tf.name_scope("normalized"):
+      norm_x = (x - mean) * tf_compat.v1.rsqrt(variance + epsilon)
+    if scale:
+      with self.var_creation_scope():
+        scale_param = self.add_param(tf_compat.v1.get_variable("scale", param_shape, initializer=tf.ones_initializer()))
+      norm_x *= tf.reshape(scale_param, param_bc_shape)
+    if bias:
+      with self.var_creation_scope():
+        bias_param = self.add_param(tf_compat.v1.get_variable("bias", param_shape, initializer=tf.zeros_initializer()))
+      norm_x += tf.reshape(bias_param, param_bc_shape)
+    self.output.placeholder = norm_x
     self.output.size_placeholder = self.input_data.size_placeholder.copy()
 
   @classmethod
@@ -642,7 +724,7 @@ class SliceLayer(_ConcatInputLayer):
             tf.maximum(0, self.output.size_placeholder[axis_wo_batch] + slice_end))
       if slice_step:
         self.output.size_placeholder[axis_wo_batch] = (
-          tf_compat.v1.ceil(tf.divide(self.output.size_placeholder[axis_wo_batch], slice_step)))
+          tf.cast(tf_compat.v1.ceil(tf.divide(self.output.size_placeholder[axis_wo_batch], slice_step)), tf.int32))
       from returnn.tf.util.basic import DimensionTag
       if not DimensionTag.get_tag_from_size_tensor(self.output.size_placeholder[axis_wo_batch]):
         tag = DimensionTag(
@@ -1065,7 +1147,7 @@ class LinearLayer(_ConcatInputLayer):
         b = None
 
     with tf.name_scope("linear"):
-      from returnn.tf.util.basic import dot, to_int32_64, is_gpu_available, move_axis
+      from returnn.tf.util.basic import dot, to_int32_64, is_gpu_available_in_session, move_axis
       x = input_data.placeholder
       ndim = x.get_shape().ndims
 
@@ -1075,7 +1157,7 @@ class LinearLayer(_ConcatInputLayer):
         ndim += 1
       elif self.input_data.feature_dim_axis == self.input_data.batch_ndim - 1:
         x = dot(x, weights_, transpose_b=self.use_transposed_weights)
-      elif self.input_data.is_batch_feature_major and is_gpu_available():  # CuDNN has a fast version for this
+      elif self.input_data.is_batch_feature_major and is_gpu_available_in_session():  # CuDNN has fast version for this
         # Use conv instead, it has optimized code for batch-feature major (only CuDNN).
         x_shape = None
         if self.input_data.batch_ndim > 3:
@@ -1722,6 +1804,8 @@ class WindowLayer(_ConcatInputLayer):
   E.g. if the input is (batch, time, dim), the output is (batch, time, window_size, dim).
   If you want to merge the (window_size, dim) together to (window_size * dim,),
   you can use the MergeDimsLayer, e.g. {"class": "merge_dims", "axes": "except_time"}.
+  Use stride==window_size and window_right=window_size - 1 in combination with a
+  MergeDimsLayer to achieve feature stacking with right-hand zero padding.
 
   This is not to take out a window from the time-dimension.
   See :class:`SliceLayer` or :class:`SliceNdLayer`.
@@ -1729,13 +1813,14 @@ class WindowLayer(_ConcatInputLayer):
   layer_class = "window"
   recurrent = True  # we must not allow any shuffling in the time-dim or so
 
-  def __init__(self, window_size, window_left=None, window_right=None, axis="T", padding="same", **kwargs):
+  def __init__(self, window_size, window_left=None, window_right=None, axis="T", padding="same", stride=1, **kwargs):
     """
     :param int window_size:
     :param int|None window_left:
     :param int|None window_right:
     :param str|int axis: see Data.get_axis_from_description()
     :param str padding: "same" or "valid"
+    :param int stride: return only each Nth window
     :param kwargs:
     """
     super(WindowLayer, self).__init__(**kwargs)
@@ -1755,14 +1840,14 @@ class WindowLayer(_ConcatInputLayer):
       self.output.placeholder = windowed_nd(
         data.placeholder,
         window_size=window_size, window_left=window_left, window_right=window_right,
-        padding=padding, time_axis=axis, new_window_axis=axis + 1)
+        padding=padding, time_axis=axis, new_window_axis=axis + 1, stride=stride)
     self.output.placeholder.set_shape(tf.TensorShape(self.output.batch_shape))
     self.output.size_placeholder = self.input_data.size_placeholder.copy()
     axis_wo_b = self.output.get_batch_axis_excluding_batch(axis)
     if axis_wo_b in self.output.size_placeholder:
       self.output.size_placeholder[axis_wo_b] = ConvLayer.calc_out_dim(
         in_dim=self.output.size_placeholder[axis_wo_b],
-        filter_size=window_size, stride=1, dilation_rate=1, padding=padding)
+        filter_size=window_size, stride=stride, dilation_rate=1, padding=padding)
 
   @classmethod
   def get_out_data_from_opts(cls, name, window_size, axis="T", sources=(), **kwargs):
@@ -2112,7 +2197,8 @@ class MergeDimsLayer(_ConcatInputLayer):
       input_data=input_data, merge_axes=axes, old_axis=input_data.batch_dim_axis)
     new_shape = [d for (i, d) in enumerate(data.batch_shape) if i not in axes]
     new_shape.insert(merge_target_axis, res_dim)
-    new_shape.pop(data.batch_dim_axis)
+    if data.batch_dim_axis is not None:
+      new_shape.pop(data.batch_dim_axis)
     data.shape = tuple(new_shape)
     data.time_dim_axis = cls._old_axis_to_new_axis(
       input_data=input_data, merge_axes=axes, old_axis=input_data.time_dim_axis)
@@ -2957,7 +3043,7 @@ class ConvLayer(_ConcatInputLayer):
               filter_size=filter_size[i], stride=strides[i], dilation_rate=dilation_rate[i], padding=padding)
     feature_dim_axis = NotSpecified
     # Swap the dims if the input dim order doesn't fit the flag auto_use_channel_first.
-    if tf_util.is_gpu_available() and (auto_use_channel_first or data.is_batch_feature_major):
+    if tf_util.is_gpu_available_in_session() and (auto_use_channel_first or data.is_batch_feature_major):
       feature_dim_axis = 1
       shape = shape[-1:] + shape[:-1]
     return {
@@ -3094,7 +3180,7 @@ class PoolLayer(_ConcatInputLayer):
           filter_size=pool_size[i], stride=strides[i], dilation_rate=dilation_rate[i], padding=padding)
     feature_dim_axis = NotSpecified
     # Swap the dims if use_channel_first is set.
-    if tf_util.is_gpu_available() and use_channel_first:
+    if tf_util.is_gpu_available_in_session() and use_channel_first:
       feature_dim_axis = 1
       shape = shape[-1:] + shape[:-1]
     return Data(
@@ -3239,6 +3325,14 @@ class TransposedConvLayer(_ConcatInputLayer):
     out = out.copy_template(name="%s_output" % name)
     assert out.have_feature_axis()
     out = out.copy_template_replace_dim(axis=-1, new_dim=n_out)
+    shape = list(out.shape)
+    if strides is None:
+      strides = filter_size
+    assert len(strides) == len(out.get_spatial_axes()), "Expected strides for all spatial axes"
+    for idx, axis in enumerate(out.get_spatial_axes()):  # counted without batch-dim axis
+      if axis + 1 not in out.get_dynamic_axes():  # out.get_dynamic_axes() is counted with batch-dim axis
+        shape[axis] *= strides[idx]
+    out.shape = tuple(shape)
     out.size_placeholder.clear()  # will be reset in __init__
     return out
 
@@ -3888,11 +3982,13 @@ class PostfixInTimeLayer(_ConcatInputLayer):
     assert self.output.time_dim_axis is not None
     assert isinstance(postfix, (float, int, LayerBase))
     if isinstance(postfix, LayerBase):
+      self.postfix_layer = postfix
       assert not postfix.output.have_time_axis(), 'Postfix layer with time axis not implemented yet'
       postfix = postfix.output.copy_compatible_to(self.output)
       assert self.output.time_dim_axis_excluding_batch not in postfix.size_placeholder
       c = postfix.placeholder
     else:
+      self.postfix_layer = None
       c = tf.constant(postfix, dtype=self.output.dtype)
     added_shape = [
       ((self.output.batch_shape[i] or tf.shape(self.output.placeholder)[i])
@@ -3918,14 +4014,18 @@ class PostfixInTimeLayer(_ConcatInputLayer):
     tag.set_tag_on_size_tensor(self.output.size_placeholder[self.output.time_dim_axis_excluding_batch])
 
   @classmethod
-  def get_out_data_from_opts(cls, name, sources, **kwargs):
+  def get_out_data_from_opts(cls, name, sources, postfix=0.0, **kwargs):
     """
     :param str name:
     :param list[LayerBase] sources:
+    :param float|int|LayerBase postfix: constant or other layer without time axis to use as postfix
     :rtype: Data
     """
     # Note: Time seq len is not correct...
-    return get_concat_sources_data_template(sources, name="%s_output" % name)
+    out = get_concat_sources_data_template(sources, name="%s_output" % name)
+    if isinstance(postfix, LayerBase):
+      out.beam = SearchBeam.get_combined_beam(out.beam, postfix.output.beam)
+    return out
 
   @classmethod
   def transform_config_dict(cls, d, network, get_layer):
@@ -3939,6 +4039,15 @@ class PostfixInTimeLayer(_ConcatInputLayer):
       postfix = d["postfix"]
       if isinstance(postfix, str):
         d["postfix"] = get_layer(postfix)
+
+  def get_dep_layers(self):
+    """
+    :rtype: list[LayerBase]
+    """
+    deps = super(PostfixInTimeLayer, self).get_dep_layers()
+    if self.postfix_layer:
+      deps.append(self.postfix_layer)
+    return deps
 
 
 class TimeChunkingLayer(_ConcatInputLayer):
@@ -4056,8 +4165,8 @@ class DotLayer(LayerBase):
     """
     from returnn.tf.util.basic import prod
     super(DotLayer, self).__init__(**kwargs)
-    a_out = self.sources[0].output.copy_as_batch_major()
-    b_out = self.sources[1].output.copy_as_batch_major()
+    a_out = self.sources[0].output.copy()
+    b_out = self.sources[1].output.copy()
     a_reduce_axes = a_out.get_axes_from_description(red1)
     b_reduce_axes = b_out.get_axes_from_description(red2)
     assert a_reduce_axes and b_reduce_axes, "%s: sources %r, red1 %r, red2 %r" % (self, self.sources, red1, red2)
@@ -4169,9 +4278,9 @@ class DotLayer(LayerBase):
     """
     assert len(sources) == 2, "dot-layer %r: needs exactly two sources" % (name,)
     # See __init__.
-    a_out = sources[0].output.copy_as_batch_major()
+    a_out = sources[0].output.copy()
     a_reduce_axes = a_out.get_axes_from_description(red1)
-    b_out = sources[1].output.copy_as_batch_major()
+    b_out = sources[1].output.copy()
     assert not a_out.beam or not b_out.beam or a_out.beam == b_out.beam
     b_reduce_axes = b_out.get_axes_from_description(red2)
     assert a_reduce_axes and b_reduce_axes, "%s: sources %r, red1 %r, red2 %r" % (name, sources, red1, red2)
@@ -4186,35 +4295,54 @@ class DotLayer(LayerBase):
     a_rem_dims = [a_shape[i] for i in a_rem_axes]
     a_var_dims = [a_shape[i] for i in a_var_axes]
     b_var_dims = [b_shape[i] for i in b_var_axes]
-    time_dim_axis = None
-    if a_out.time_dim_axis is not None:
-      time_dim_axis = cls._axis1_to_output(a_out.time_dim_axis, a_rem_axes=a_rem_axes, a_var_axes=a_var_axes)
-    if time_dim_axis is None and b_out.time_dim_axis is not None:
-      time_dim_axis = cls._axis2_to_output(
-        b_out.time_dim_axis, b_rem_axes=b_rem_axes, a_var_axes=a_var_axes, b_var_axes=b_var_axes)
-    if time_dim_axis is None and (a_out.time_dim_axis is not None or b_out.time_dim_axis is not None):
-      # We had some time dim axis before and reduced it now.
-      # But maybe there are others, so let's automatically figure out.
-      time_dim_axis = NotSpecified
+
+    def find_axis(a_axis, b_axis):
+      """
+      :param int|None a_axis:
+      :param int|None b_axis:
+      :rtype: int|None|NotSpecified
+      """
+      axis = None
+      if a_axis is not None:
+        axis = cls._axis1_to_output(a_axis, a_rem_axes=a_rem_axes, a_var_axes=a_var_axes)
+      if axis is None and b_axis is not None:
+        axis = cls._axis2_to_output(b_axis, b_rem_axes=b_rem_axes, a_var_axes=a_var_axes, b_var_axes=b_var_axes)
+      if axis is None and (a_axis is not None or b_axis is not None):
+        # We had some time dim axis before and reduced it now.
+        # But maybe there are others, so let's automatically figure out.
+        # this should not happen for the batch_dim_axis, we chack for that outside this function
+        axis = NotSpecified
+      return axis
+
+    time_dim_axis = find_axis(a_out.time_dim_axis, b_out.time_dim_axis)
+    batch_dim_axis = find_axis(a_out.batch_dim_axis, b_out.batch_dim_axis)
+    assert batch_dim_axis != NotSpecified or (a_out.batch_dim_axis is None and b_out.batch_dim_axis is None)
+
     if not b_var_dims and add_var2_if_empty:
       b_var_dims.append(1)
+
     # Collect dynamic size info.
     size_placeholder = {}
     for axis1_wo_b in sorted(a_out.size_placeholder.keys()):
-      axis_out_wb = cls._axis1_to_output(axis1_wo_b + 1, a_rem_axes=a_rem_axes, a_var_axes=a_var_axes)
+      axis_out_wb = cls._axis1_to_output(a_out.get_batch_axis(axis1_wo_b), a_rem_axes=a_rem_axes, a_var_axes=a_var_axes)
       if axis_out_wb is None:
         continue
-      size_placeholder[axis_out_wb - 1] = a_out.size_placeholder[axis1_wo_b]
+      size_placeholder[a_out.get_batch_axis_excluding_batch(axis_out_wb)] = a_out.size_placeholder[axis1_wo_b]
     for axis2_wo_b in sorted(b_out.size_placeholder.keys()):
       axis_out_wb = cls._axis2_to_output(
-        axis2_wo_b + 1, b_rem_axes=b_rem_axes, a_var_axes=a_var_axes, b_var_axes=b_var_axes)
+        b_out.get_batch_axis(axis2_wo_b), b_rem_axes=b_rem_axes, a_var_axes=a_var_axes, b_var_axes=b_var_axes)
       if axis_out_wb is None or axis_out_wb in size_placeholder:
         continue
-      size_placeholder[axis_out_wb - 1] = b_out.size_placeholder[axis2_wo_b]
+      size_placeholder[b_out.get_batch_axis_excluding_batch(axis_out_wb)] = b_out.size_placeholder[axis2_wo_b]
+
+    shape = list(a_rem_dims + a_var_dims + b_var_dims)
+    if batch_dim_axis is not None and batch_dim_axis is not NotSpecified:
+      shape.pop(batch_dim_axis)
+
     return Data(
       name="%s_output" % name,
-      shape=tuple(a_rem_dims[1:] + a_var_dims + b_var_dims),
-      batch_dim_axis=0,
+      shape=tuple(shape),
+      batch_dim_axis=batch_dim_axis,
       time_dim_axis=time_dim_axis,
       dtype=a_out.dtype,
       size_placeholder=size_placeholder,
@@ -4804,6 +4932,7 @@ class CompareLayer(LayerBase):
     elif out_type_.get("sparse", False):
       out_type_["dim"] = 2
     out_type_["dtype"] = "bool"
+    out_type_["vocab"] = None
     out_type_["name"] = "%s_output" % kwargs["name"]
     if out_type:
       if isinstance(out_type, dict):
@@ -5682,10 +5811,11 @@ class LossLayer(LayerBase):
       network=network, get_layer=get_layer, always_make=True)
 
   @classmethod
-  def get_out_data_from_opts(cls, name, sources, **kwargs):
+  def get_out_data_from_opts(cls, name, sources, target_=None, **kwargs):
     """
     :param str name:
     :param list[LayerBase] sources:
+    :param LayerBase|None target_:
     :rtype: Data
     """
     assert len(sources) == 1
@@ -5693,6 +5823,9 @@ class LossLayer(LayerBase):
     if out.have_feature_axis():
       out = out.copy_template_excluding_axis(out.feature_dim_axis)
     out.dtype = "float32"
+    if target_:
+      out.beam = SearchBeam.get_combined_beam(out.beam, target_.output.beam)
+      out.available_for_inference = out.available_for_inference & target_.output.available_for_inference
     return out
 
 
@@ -6552,11 +6685,12 @@ class CrossEntropyLoss(Loss):
     """
     output_flat = self.output_flat
     if output_flat is None:
-      output_flat = self.output.get_placeholder_time_flattened()
+      output_flat = self._flatten_or_merge(
+        self.output.placeholder, self.output_seq_lens, time_major=self.output.is_time_major)
     target_flat_exp = tf.stack(
       [tf.range(tf.shape(self.target_flat)[0], dtype=tf.int32),
        tf.cast(self.target_flat, tf.int32)], axis=1)  # (time,2)
-    out = tf.gather_nd(output_flat, target_flat_exp)
+    out = tf.gather_nd(output_flat, target_flat_exp, name="ce_output_target_scores")
     return out
 
   def get_value(self):
@@ -7199,7 +7333,7 @@ class ExpectedLoss(Loss):
       corrected_losses = losses
       if self.norm_scores:
         scores_norm_shift = tf.reduce_logsumexp(
-          beam_scores, name="scores_norm_shift", axis=1, keep_dims=True)  # (batch,1)
+          beam_scores, name="scores_norm_shift", axis=1, keepdims=True)  # (batch,1)
         if self.norm_scores_stop_gradient:
           scores_norm_shift = tf.stop_gradient(scores_norm_shift)
         # Thus sum(value_weights) == 1.

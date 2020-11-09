@@ -117,7 +117,7 @@ class RecLayer(_ConcatInputLayer):
     """
     super(RecLayer, self).__init__(**kwargs)
     import re
-    from returnn.tf.util.basic import is_gpu_available
+    from returnn.tf.util.basic import is_gpu_available_in_session
     rnn_contrib = None
     try:
       # noinspection PyUnresolvedReferences
@@ -126,7 +126,7 @@ class RecLayer(_ConcatInputLayer):
       pass
     from tensorflow.python.util import nest
     cudnn_rnn = None
-    if is_gpu_available():
+    if is_gpu_available_in_session():
       try:
         # noinspection PyUnresolvedReferences
         from tensorflow.contrib import cudnn_rnn
@@ -362,23 +362,18 @@ class RecLayer(_ConcatInputLayer):
     """
     from tensorflow.python.util import nest
     source_data = get_concat_sources_data_template(sources) if sources else None
-    if source_data and not source_data.have_time_axis():
-      # We expect to be inside another RecLayer, and should do a single step (like RnnCellLayer).
-      out_time_dim_axis = None
-      out_batch_dim_axis = 0
-    else:
-      out_time_dim_axis = 0
-      out_batch_dim_axis = 1
     n_out = kwargs.get("n_out", NotSpecified)
     out_type = kwargs.get("out_type", None)
     loss = kwargs.get("loss", None)
     deps = list(sources)  # type: typing.List[LayerBase]
     deps += [layer for layer in nest.flatten(initial_state) if isinstance(layer, LayerBase)]
     if out_type or n_out is not NotSpecified or loss:
-      if out_type:
-        assert out_type.get("time_dim_axis", out_time_dim_axis) == out_time_dim_axis
-        assert out_type.get("batch_dim_axis", out_batch_dim_axis) == out_batch_dim_axis
       out = super(RecLayer, cls).get_out_data_from_opts(network=network, sources=sources, **kwargs)
+      if source_data and not source_data.have_time_axis():
+        # We expect to be inside another RecLayer, and should do a single step (like RnnCellLayer).
+        out = out.copy_as_batch_major()  # The output is then [B,F]
+      else:
+        out = out.copy_as_time_batch_major()  # Otherwise the output is always [T,B,F]
     else:
       out = None
     if isinstance(unit, dict):  # subnetwork
@@ -390,15 +385,15 @@ class RecLayer(_ConcatInputLayer):
         assert sub_out.dim == out.dim
         assert sub_out.shape == out.shape
       out = sub_out
-      out_batch_dim_axis = out.batch_dim_axis  # maybe the subnet does not have a batch-axis (rare but valid)
       deps += subnet.get_parent_deps()
     assert out
-    out.time_dim_axis = out_time_dim_axis
-    out.batch_dim_axis = out_batch_dim_axis
     cls._post_init_output(output=out, sources=sources, network=network, **kwargs)
     for dep in deps:
       if dep:
         out.beam = SearchBeam.get_combined_beam(out.beam, dep.output.beam)
+    if out_type:
+      assert out_type.get("time_dim_axis", out.time_dim_axis) == out.time_dim_axis
+      assert out_type.get("batch_dim_axis", out.batch_dim_axis) == out.batch_dim_axis
     return out
 
   def get_absolute_name_scope_prefix(self):
@@ -432,7 +427,7 @@ class RecLayer(_ConcatInputLayer):
   @classmethod
   def _create_rnn_cells_dict(cls):
     import returnn.tf.native_op as tf_native_op
-    from returnn.tf.util.basic import is_gpu_available
+    from returnn.tf.util.basic import is_gpu_available_in_session
     allowed_types = (rnn_cell.RNNCell, tf_native_op.RecSeqCellOp)
     rnn_contrib = None
     try:
@@ -442,7 +437,7 @@ class RecLayer(_ConcatInputLayer):
     except ImportError:
       pass
     cudnn_rnn = None
-    if is_gpu_available():
+    if is_gpu_available_in_session():
       try:
         # noinspection PyUnresolvedReferences
         from tensorflow.contrib import cudnn_rnn
@@ -492,8 +487,15 @@ class RecLayer(_ConcatInputLayer):
     """
     if not cls._rnn_cells_dict:
       cls._create_rnn_cells_dict()
-    from returnn.tf.util.basic import is_gpu_available
-    if not is_gpu_available():
+    # We have some automatic replacement logic here.
+    # In our CustomCheckpointLoader, we have logic to automatically convert one param format into another.
+    # Be careful though that the defaults still might lead to different computations.
+    # E.g. StandardLSTM/BasicLSTM use forget_bias=1 by default, which is not used for param initialization,
+    # but will always be added.
+    # Thus when changing from e.g. NativeLSTM -> StandardLSTM, param importing works,
+    # but you explicitly need to specify `"unit_opts": {"forget_bias": 0.0}`, otherwise it will be wrong.
+    from returnn.tf.util.basic import is_gpu_available_in_session
+    if not is_gpu_available_in_session():
       m = {"cudnnlstm": "LSTMBlockFused", "cudnngru": "GRUBlock"}
       if name.lower() in m:
         if name.lower() not in cls._warn_msg_once_for_cell_name:
@@ -524,11 +526,7 @@ class RecLayer(_ConcatInputLayer):
     """
     assert self.input_data
     if self.input_data.have_time_axis():
-      x = self.input_data.placeholder  # (batch,time,dim) or (time,batch,dim)
-      if not self.input_data.is_time_major:
-        assert self.input_data.batch_dim_axis == 0
-        assert self.input_data.time_dim_axis == 1
-        x = self.input_data.get_placeholder_as_time_major()  # (time,batch,[dim])
+      x = self.input_data.copy_as_time_batch_major().placeholder
       seq_len = self.input_data.get_sequence_lengths()
       return x, seq_len
     else:  # no time-dim-axis, expect to be inside another RecLayer
@@ -599,7 +597,7 @@ class RecLayer(_ConcatInputLayer):
     :param None|dict[str] unit_opts:
     :rtype: _SubnetworkRecCell|tensorflow.contrib.rnn.RNNCell|tensorflow.contrib.rnn.FusedRNNCell|TFNativeOp.RecSeqCellOp  # nopep8
     """
-    from returnn.tf.util.basic import is_gpu_available
+    from returnn.tf.util.basic import is_gpu_available_in_session
     rnn_contrib = None
     try:
       # noinspection PyUnresolvedReferences
@@ -615,7 +613,7 @@ class RecLayer(_ConcatInputLayer):
     n_hidden = self.output.dim
     if unit_opts is None:
       unit_opts = {}
-    if is_gpu_available():
+    if is_gpu_available_in_session():
       try:
         # noinspection PyUnresolvedReferences
         from tensorflow.contrib import cudnn_rnn
@@ -2115,6 +2113,8 @@ class _SubnetworkRecCell(object):
       if self.input_layers_moved_out:
         with tf.name_scope("input_layers_moved_out"):
           self._construct_input_layers_moved_out()
+          if fixed_seq_len is None and rec_layer.output.size_placeholder:  # might have set it by now
+            fixed_seq_len = rec_layer.output.size_placeholder[0]
           for layer_name in self.input_layers_moved_out:
             # Create only Tensor arrays for those which we use inside the loop.
             if not self._input_layer_used_inside_loop(layer_name):
@@ -2123,11 +2123,6 @@ class _SubnetworkRecCell(object):
             assert isinstance(layer, LayerBase)
             if layer_name == "output":
               assert layer.output.have_time_axis()
-              # If we don't know our own size yet, we can overtake it from this layer.
-              if not rec_layer.output.size_placeholder:
-                rec_layer.output.size_placeholder = {0: layer.output.get_sequence_lengths()}
-              if fixed_seq_len is None:
-                fixed_seq_len = layer.output.get_sequence_lengths()
               assert rec_layer.output.is_same_time_dim(layer.output)
             # Only unroll if that is the same time dim.
             if not layer.output.mark_same_time(rec_layer.output):
@@ -2269,7 +2264,8 @@ class _SubnetworkRecCell(object):
 
         if seq_len_info is not None:
           assert self.net.layers["end"].output.shape == (), "end layer %r unexpected shape" % self.net.layers["end"]
-          choices = self.net.layers["end"].get_search_choices()
+          end_layer = maybe_transform(self.net.layers["end"])
+          choices = end_layer.get_search_choices()
           if choices:
             from .basic import SelectSearchSourcesLayer
             cur_end_layer = choices.translate_to_this_search_beam(prev_end_layer)
@@ -2277,7 +2273,7 @@ class _SubnetworkRecCell(object):
               "unexpected search choices: cur end %r, prev end %r" % (choices, prev_end_layer.get_search_choices()))
             assert cur_end_layer.search_choices_seq, (
               "unexpected search choices: cur end %r (via %r), prev end %r (via %r)" % (
-                choices, self.net.layers["end"], prev_end_layer.get_search_choices(), prev_end_layer))
+                choices, end_layer, prev_end_layer.get_search_choices(), prev_end_layer))
             assert cur_end_layer.output.shape == (), "end layer %r unexpected shape" % cur_end_layer
             with tf.name_scope("end_flag"):
               end_flag = cur_end_layer.output.placeholder
@@ -2597,7 +2593,12 @@ class _SubnetworkRecCell(object):
       end_layer = None
 
     if end_layer:
+      # seq_len is determined from the end-layer. We need to translate it to the right beam.
       end_layer_choice = self.net.get_search_choices(src=end_layer)
+      assert end_layer_choice and end_layer_choice.search_choices
+      if end_layer_choice.name.startswith("prev:"):
+        # Logic from maybe_transform. It would be translated to the current beam.
+        end_layer_choice = self.net.layers[end_layer_choice.name[len("prev:"):]]
       assert end_layer_choice in choice_seq_in_frame, (
         "End layer must not have a beam independent from output layer '{}'.".format(layer_name))
 
@@ -2984,6 +2985,19 @@ class _SubnetworkRecCell(object):
     with reuse_name_scope(self.parent_rec_layer._rec_scope):
       for layer_name in self.input_layers_moved_out:
         get_layer(layer_name)
+
+    # We might have figured out the real output seq length (and dim tag) by now.
+    if not self.parent_rec_layer.output.size_placeholder and "output" in self.input_layers_moved_out:
+      output_layer = self.input_layers_net.layers["output"]
+      assert output_layer.output.have_time_axis()
+      self.parent_rec_layer.output.size_placeholder = {0: output_layer.output.get_sequence_lengths()}
+    # This might be set e.g. by ChoiceLayer, or losses.
+    if not self.parent_rec_layer.output.size_placeholder and self.input_layers_net.used_data_keys:
+      for data_key in sorted(self.input_layers_net.used_data_keys):
+        data = self.input_layers_net.extern_data.data[data_key]
+        if data.have_time_axis():
+          self.parent_rec_layer.output.size_placeholder = {0: data.get_sequence_lengths()}
+          break
 
   def _construct_output_layers_moved_out(self, loop_accumulated, seq_len, extra_output_layers, final_net_vars):
     """
@@ -3644,7 +3658,11 @@ class RnnCellLayer(_ConcatInputLayer):
         x = self.input_data.placeholder
         if isinstance(self.cell, BaseRNNCell):
           x = self.cell.get_input_transformed(x)
-        assert not self.input_data or self.input_data.time_dim_axis is None
+        assert not self.input_data or self.input_data.time_dim_axis is None, (
+          self, self.input_data,
+          "A recurrent layer is not allowed to have input data with a remaining time axis.\n"
+          "A possible reason for this error is that the 'target' of the rec layer does not\n"
+          "match the targets of the sub-layers")
         self.output.time_dim_axis = None
         self.output.batch_dim_axis = 0
         prev_state = self._rec_previous_layer.rec_vars_outputs["state"]
@@ -7280,8 +7298,8 @@ class BlocksparseLSTMCell(_WrapBaseCell):
     if kwargs.get('is_training', None) is None:
       from returnn.tf.network import TFNetwork
       kwargs['is_training'] = TFNetwork.get_current_network().train_flag
-    from returnn.tf.util.basic import is_gpu_available
-    if not is_gpu_available():
+    from returnn.tf.util.basic import is_gpu_available_in_session
+    if not is_gpu_available_in_session():
       kwargs.setdefault("fast_layer_norm", False)
     super(BlocksparseLSTMCell, self).__init__(*args, **kwargs)
 
@@ -7369,8 +7387,8 @@ class BlocksparseMultiplicativeMultistepLSTMCell(_WrapBaseCell):
     if kwargs.get('is_training', None) is None:
       from returnn.tf.network import TFNetwork
       kwargs['is_training'] = TFNetwork.get_current_network().train_flag
-    from returnn.tf.util.basic import is_gpu_available
-    if not is_gpu_available():
+    from returnn.tf.util.basic import is_gpu_available_in_session
+    if not is_gpu_available_in_session():
       kwargs.setdefault("fast_layer_norm", False)
     super(BlocksparseMultiplicativeMultistepLSTMCell, self).__init__(*args, **kwargs)
 
@@ -7730,8 +7748,8 @@ class TwoDLSTMLayer(LayerBase):
     """
     super(TwoDLSTMLayer, self).__init__(**kwargs)
     import re
-    from returnn.tf.util.basic import is_gpu_available
-    assert is_gpu_available(), "currently, there's no CPU support"
+    from returnn.tf.util.basic import is_gpu_available_in_session
+    assert is_gpu_available_in_session(), "currently, there's no CPU support"
     self.pooling = pooling
     # On the random initialization:
     # For many cells, e.g. NativeLSTM: there will be a single recurrent weight matrix, (output.dim, output.dim * 4),

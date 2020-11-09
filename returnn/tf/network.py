@@ -420,36 +420,6 @@ class TFNetwork(object):
       return self.extra_parent_net.get_absolute_name_prefix() + my_prefix
     return ""
 
-  def construct_from(self, list_or_dict):
-    """
-    :param list[dict[str]] | dict[str,dict[str]] list_or_dict:
-    """
-    if isinstance(list_or_dict, (tuple, list)):
-      self.construct_from_list(list_or_dict)
-    elif isinstance(list_or_dict, dict):
-      self.construct_from_dict(list_or_dict)
-    else:
-      raise Exception("unsupported: %r (type %r)" % (list_or_dict, type(list_or_dict)))
-
-  def construct_from_list(self, net_list):
-    """
-    :param list[dict[str]] net_list: list of layer descriptions
-    """
-    net_dict = {}  # type: typing.Dict[str,typing.Dict[str]]
-    for i, layer_desc in enumerate(net_list):
-      layer_desc = layer_desc.copy()
-      name = layer_desc.pop("name", None)
-      if not name:
-        if i == len(net_list) - 1:
-          name = "output"
-        else:
-          name = "layer%i" % i
-      if i == len(net_list) - 1:
-        if "target" not in layer_desc:
-          layer_desc["target"] = self.extern_data.default_target
-      net_dict[name] = layer_desc
-    self.construct_from_dict(net_dict)
-
   def construct_from_dict(self, net_dict):
     """
     :param dict[str,dict[str]] net_dict:
@@ -725,6 +695,11 @@ class TFNetwork(object):
           layer_class.__name__, name, layer_desc)
         output_template.sanity_check(ignore_placeholder=True)  # placeholder might be overwritten later
         output_template_special_axes = output_template.get_special_axes_dict()
+        if not output_template.available_for_inference and not self.eval_flag:
+          from returnn.tf.layers.base import DataNotAvailableLayer
+          return DataNotAvailableLayer(
+            name=layer_desc['name'], network=layer_desc['network'], output=output_template,
+            layer_class=layer_class, layer_desc=layer_desc)
         layer = layer_class(**layer_desc)
         layer.post_init(layer_desc)
         layer.output.sanity_check()
@@ -2862,6 +2837,8 @@ class CustomCheckpointLoader:
     map_list = {
       "lstm_cell/biases": "lstm_cell/bias",
       "lstm_cell/weights": "lstm_cell/kernel",
+      "lstm_cell/bias": "rnn/lstm_cell/bias",
+      "lstm_cell/kernel": "rnn/lstm_cell/weights",
       "cudnn/params_canonical/rnn/multi_rnn_cell/cell_0/cudnn_compatible_lstm_cell/bias": "lstm_fused_cell/bias",
       "cudnn/params_canonical/rnn/multi_rnn_cell/cell_0/cudnn_compatible_lstm_cell/kernel": "lstm_fused_cell/kernel",
     }
@@ -2884,16 +2861,18 @@ class CustomCheckpointLoader:
 
       return load_old
 
-    def make_load_weights_nativelstm_to_basic(new_name):
+    # noinspection PyShadowingNames
+    def make_load_weights_nativelstm_to_basic(new_name, postfix):
       """
       :param str new_name:
+      :param str postfix: "/lstm_cell/kernel" or "/rnn/lstm_cell/kernel"
       :rtype: ()->numpy.ndarray
       """
-      assert new_name.endswith("/lstm_cell/kernel")
+      assert new_name.endswith(postfix)
       # noinspection PyShadowingNames
-      old_name1 = new_name[:-len("/lstm_cell/kernel")] + "/W_re"
+      old_name1 = new_name[:-len(postfix)] + "/W_re"
       # noinspection PyShadowingNames
-      old_name2 = new_name[:-len("/lstm_cell/kernel")] + "/W"
+      old_name2 = new_name[:-len(postfix)] + "/W"
 
       def load_native_lstm_weights():
         """
@@ -2913,14 +2892,16 @@ class CustomCheckpointLoader:
 
       return load_native_lstm_weights
 
-    def make_load_bias_nativelstm_to_basic(new_name):
+    # noinspection PyShadowingNames
+    def make_load_bias_nativelstm_to_basic(new_name, postfix):
       """
       :param str new_name:
+      :param str postfix: "/lstm_cell/bias" or "/rnn/lstm_cell/bias"
       :rtype: ()->numpy.ndarray
       """
-      assert new_name.endswith("/lstm_cell/bias")
+      assert new_name.endswith(postfix)
       # noinspection PyShadowingNames
-      old_name = new_name[:-len("/lstm_cell/bias")] + "/b"
+      old_name = new_name[:-len(postfix)] + "/b"
 
       def load_native_lstm_bias():
         """
@@ -3041,22 +3022,27 @@ class CustomCheckpointLoader:
     # Here we try to make matches of missing vars and vars which seem to be obsolete.
     for v in missing_var_names:
       # Check NativeLSTM -> BasicLSTM.
-      if v.endswith("/lstm_cell/kernel"):
-        old_name1 = v[:-len("/lstm_cell/kernel")] + "/W_re"
-        old_name2 = v[:-len("/lstm_cell/kernel")] + "/W"
-        if old_name1 in obsolete_var_names and old_name2 in obsolete_var_names:
-          var_name_map[v] = make_load_weights_nativelstm_to_basic(v)
-      if v.endswith("/lstm_cell/bias"):
-        old_name = v[:-len("/lstm_cell/bias")] + "/b"
-        if old_name in obsolete_var_names:
-          var_name_map[v] = make_load_bias_nativelstm_to_basic(v)
+      for postfix in [
+        "/rnn/lstm_cell/kernel", "/lstm_cell/kernel", "/rnn/basic_lstm_cell/kernel", "/basic_lstm_cell/kernel"]:
+        if v.endswith(postfix):
+          old_name1 = v[:-len(postfix)] + "/W_re"
+          old_name2 = v[:-len(postfix)] + "/W"
+          if old_name1 in obsolete_var_names and old_name2 in obsolete_var_names:
+            var_name_map[v] = make_load_weights_nativelstm_to_basic(v, postfix=postfix)
+            break
+      for postfix in [
+        "/rnn/lstm_cell/bias", "/lstm_cell/bias", "/rnn/basic_lstm_cell/bias", "/basic_lstm_cell/bias"]:
+        if v.endswith(postfix):
+          old_name = v[:-len(postfix)] + "/b"
+          if old_name in obsolete_var_names:
+            var_name_map[v] = make_load_bias_nativelstm_to_basic(v, postfix=postfix)
       # Check BasicLSTM -> NativeLSTM.
       if v.endswith("/rec/W_re"):
         prefix = v[:-len("/rec/W_re")]
         cur_name_w = "%s/rec/W" % prefix
         cur_name_b = "%s/rec/b" % prefix
-        old_name_kernel = "%s/rec/lstm_cell/kernel" % prefix
-        old_name_bias = "%s/rec/lstm_cell/bias" % prefix
+        old_name_kernel = "%s/rec/rnn/lstm_cell/kernel" % prefix
+        old_name_bias = "%s/rec/rnn/lstm_cell/bias" % prefix
         if (
               old_name_kernel in obsolete_var_names and
               old_name_bias in obsolete_var_names and
